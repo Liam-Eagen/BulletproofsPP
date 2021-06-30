@@ -1,0 +1,70 @@
+name:                BulletproofsPP
+version:             0.1.0.0
+github:              "githubuser/BulletproofsPP"
+license:             BSD3
+author:              "Liam Eagen"
+maintainer:          "liameagen@protonmail.com"
+copyright:           "2021 Liam Eagen"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/githubuser/BulletproofsPP#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- mtl
+- bytestring
+- protolude
+- elliptic-curve
+- galois-field
+- SHA
+  #- bulletproofs
+  #- arithmetic-circuits
+  #- ghc-typelits-knownnat
+  #- ghc-typelits-natnormalise
+  #- vector
+- integer-gmp
+- semirings
+- groups
+- random
+- QuickCheck
+- wl-pprint-text
+- vector-space
+- tasty-quickcheck
+  #- MonadRandom
+- deepseq
+- containers
+
+library:
+  source-dirs: src
+
+executables:
+  BulletproofsPP-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - BulletproofsPP
+
+tests:
+  BulletproofsPP-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - BulletproofsPP
