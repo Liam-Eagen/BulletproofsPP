@@ -1,0 +1,10 @@
+{
+  "typed"  : true,
+  "ranges" : [{
+    "base"   : 256,
+    "count"  : 511,
+    "max"    : 18446744073709551616,
+    "min"    : 0,
+    "isShared" : true
+  }]
+}

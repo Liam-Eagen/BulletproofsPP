@@ -1,0 +1,29 @@
+{
+  "typed"  : true,
+  "basisFile" : "points.bin",
+  "ranges" : [{
+    "base"   : 3,
+    "min"    : 0,
+    "max"    : 18446744073709551616,
+    "isShared" : true,
+    "isOutput" : true
+  }, {
+    "base"   : 16,
+    "min"    : -20,
+    "max"    : 73786976294838206463,
+    "isShared" : true,
+    "isOutput" : false
+  }, {
+    "base"   : 5,
+    "min"    : 1,
+    "max"    : 625,
+    "isShared" : false,
+    "isAssumed" : true,
+    "isOutput" : false
+  }],
+  "public" : [{
+    "amount" : 1,
+    "type" : 15,
+    "isOutput" : false
+  }]
+}

@@ -1,6 +1,6 @@
 name:                BulletproofsPP
 version:             0.1.0.0
-github:              "githubuser/BulletproofsPP"
+github:              "liameagen/BulletproofsPP"
 license:             BSD3
 author:              "Liam Eagen"
 maintainer:          "liameagen@protonmail.com"
@@ -17,35 +17,55 @@ extra-source-files:
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
 # common to point users to the README.md file.
-description:         Please see the README on GitHub at <https://github.com/githubuser/BulletproofsPP#readme>
+description:         Please see the README on GitHub at <https://github.com/liameagen/BulletproofsPP#readme>
 
 dependencies:
-- base >= 4.7 && < 5
-- mtl
-- bytestring
-- protolude
-- elliptic-curve
-- galois-field
-- SHA
-  #- bulletproofs
-  #- arithmetic-circuits
-  #- ghc-typelits-knownnat
-  #- ghc-typelits-natnormalise
-  #- vector
-- integer-gmp
-- semirings
-- groups
-- random
-- QuickCheck
-- wl-pprint-text
-- vector-space
-- tasty-quickcheck
-  #- MonadRandom
-- deepseq
-- containers
+    - QuickCheck
+    - binary
+    - SHA
+    - cryptohash-sha256
+    - base # >=4.7 && <5
+    - bytestring
+    - containers
+    - deepseq
+    - elliptic-curve
+    - galois-field
+    - groups
+    - integer-gmp
+    - mtl
+    - protolude
+    - random
+    - semirings
+    - tasty-quickcheck
+    - vector-space
+    - wl-pprint-text
+    - ghc-typelits-natnormalise  
+    - ghc-typelits-knownnat
+    - parallel
+    - vector
+    - vector-th-unbox
+    - aeson
+    - text
+    - optparse-applicative
+    - cryptonite                # FFI EC operations for 25519
 
 library:
   source-dirs: src
+  ghc-options:
+  - -O2
+  default-extensions:
+  - TypeFamilies
+  - GeneralizedNewtypeDeriving
+  - DeriveFunctor
+  - DeriveFoldable
+  - DeriveTraversable
+  - ConstraintKinds
+  - TupleSections
+  - BangPatterns
+  - FlexibleContexts
+  - DataKinds
+  - ScopedTypeVariables
+  - KindSignatures
 
 executables:
   BulletproofsPP-exe:
@@ -55,6 +75,7 @@ executables:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
+    - -O2
     dependencies:
     - BulletproofsPP
 

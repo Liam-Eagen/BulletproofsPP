@@ -1,0 +1,12 @@
+{
+  "basisSeed" : "test points",
+  "argument" : "NL",
+  "ranges" : [{
+    "count"  : 128,
+    "base"   : 256,
+    "min"    : 0,
+    "max"    : 18446744073709551616,
+    "isOutput" : true,
+    "isShared" : true
+  }]
+}

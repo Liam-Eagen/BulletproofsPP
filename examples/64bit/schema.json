@@ -1,0 +1,10 @@
+{
+  "basisFile" : "points.bin",
+  "argument" : "IP",
+  "ranges" : [{
+    "base"   : 16,
+    "min"    : 0,
+    "max"    : 18446744073709551616,
+    "isOutput" : true
+  }]
+}

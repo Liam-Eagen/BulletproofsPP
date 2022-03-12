@@ -1,0 +1,12 @@
+{
+  "basisFile" : "points.bin",
+  "argument" : "NL",
+  "ranges" : [{
+    "count"  : 32,
+    "base"   : 64,
+    "min"    : 0,
+    "max"    : 18446744073709551616,
+    "isOutput" : true,
+    "isShared" : true
+  }]
+}

@@ -1,121 +1,116 @@
-{-# LANGUAGE TupleSections, DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
-{-# LANGUAGE TypeFamilies, FlexibleContexts, BangPatterns #-}
-
 module RangeProof.TypedReciprocal where
 
+import Data.Proxy
 import Data.Bifunctor
 import Control.Monad (replicateM)
-import Data.Maybe (catMaybes, fromJust)
-import Data.List (uncons, unzip4, unzip5, zipWith5, zipWith6, sortOn, foldl')
+import Data.Maybe (catMaybes)
+import Data.List (unzip5, zipWith4, zipWith5, zipWith6, sortOn, foldl', mapAccumL)
+import qualified Data.Set as S
 import qualified Data.Map as M
 import Data.VectorSpace
 
+import qualified Data.ByteString.Lazy as BS
+import Data.Field.Galois hiding ((*^), recip)
+import Data.Field.BatchInverse
+
 import Utils
 import Commitment
-import NormLinearProof
+import ZKP
 
+import Bulletproof
+import RangeProof
 import RangeProof.Internal
 
--- NOTE see paper for complete description
---
--- Implements the superset of inline reciprocal range proofs, shared reciprocal
--- range proofs, and typed confidential transactions. Takes a colletion of
--- commitments each of which: is tx input or output, has inline or shared digits,
--- has a range [A, B) B - A < p and has an integer base b s.t. 1 < b < p. Each
--- commitment has a value and a type, but typed conservation of money can be
--- disabled.
---
--- To show that all the digits of every number belong to the correct set of
--- symbol values (0..b-1 for base b) we use the reciprocal technique and show
--- that, given ds and ms commitments:
---
--- sum[i=0..n-1] 1/(e + d[i]) - sum[j=1..b-1] m[j] ( 1/(e + j) - 1/e ) = n/e
---
--- For typed conservation of money we use a similar argument and show that for
--- sets I and O and commitments to vs and ts:
---
--- sum[(v,t) in I] v/(e + t) - sum[(v,t) in O] v/(e + t) = 0
---
--- In both cases we want to show 
+-------------
+-- Summary --
 
-
--- Implements the reciprocal range proof construction for typed inputs. That is,
--- given a collection of inputs containing a value and a type, we check that
--- every value lies in the appropriate range and that the sum of the input
--- amounts of each type equals the amounts of each type. We do this in zero
--- knowledge with respect to the type of each value and which/how many types are
--- involved in the transaction, besides the obvious restriction that there
--- cannot be more types that the total number of inputs and outputs and whatever
--- the fee amount is (TODO add this).
+-- See paper for detailed discussion. Implements the typed confidential
+-- transaction protocol, which is (almost) a super set of the inline digit
+-- and the shared digit reciprocal range proofs.
 --
--- This is accomplished buy summing:
+-- The basic organization of these range proofs isto three data commitments and
+-- one blinding commitment. The prover will first compute the digit
+-- representations of each value in its respective base. Then, for the shared
+-- digits, the prover will sum the multiplicities for each base. 
 --
--- sum[i] v[i] / (e - t[i]) - sum[o] v[o] / (e - t[o]) = 0
+-- The prover will commit to the inline mulitplicities in the M commitment and
+-- the shared multiplicities and the digits in the D commitment. The verifier
+-- will choose the challenge for the reciprocal and the prover will commit to
+-- the reciprocals in the the R commitment (phase 2).
 --
--- Where (t[i], v[i]) are the inputs and (t[o], v[o]) are the outputs. More
--- concretely, we can piggy back on the existing range proof structure and add
--- one linear term where all the types a will be cannonically committed to and
--- then append the vector of types to the d vector and the vector of reciprocals
--- to the r vector.
+-- Then, the prover will commit to the blinding values for the
+-- digits/reciprocals in the norm vector and the shared digits in the linear
+-- vector as necessary. This commitment also uses the blinding procedure from
+-- the paper to blind the error terms.
 --
--- We then scale the inputs by (x^i + q^j) to balance the corresponding products
---
--- (t - e) r = v
---
--- We will then scale the types linearly by a different linear vector added to
--- the reciprocals to balance the sum of types by these weights on the values,
--- with the overall sum scaled to lie on linearly independent q powers. We use
--- the basic technique
---
--- (Q v + q^a (Q + X Q^-1) 1) y + (Q (e - t) + q^b Q^-1 1) y^3
---
--- This puts all the data on the <r, d> term (y^4) and avoids adding any new
--- error terms. So long as q^a and q^b are chosen so that the types do not
--- overlap with the rest of the q powers, this is sound.
---
--- NOTE if the ranges used include zero anyone can create/destroy a value of
--- any type with balance zero. If this is undesirable, start the range at 1.
+-- Control is then handed over the generic range proof protocol which will
+-- invoke the appropriate bulletproof argument prover.
 
 -------------
 -- Phase 1 --
 
---data Phase1 a = Ph1Inline { bit :: Bool, b :: a, d :: a, m :: a, s :: a }
-data Phase1 a 
-  = Ph1Inline Integer a a a a       -- Stores base, digit coeff, digit value, mult and symbol
-  | Ph1Shared Integer a a           -- Doesn't store mults or symbol inline
-  | Ph1Typing Bool a a              -- Stores amount and type and isOutput (True output, False input)
+-- a is public b is private
+data Phase1 a b
+  = Ph1Inline Int Integer a b b a       -- Stores base, digit coeff, digit value, mult and symbol
+  | Ph1Shared Int Integer a b           -- Doesn't store mults or symbol inline
+  | Ph1Typing Int Bool Bool b b         -- Stores amount and type and isOutput (True output, False input) isAssumed
   deriving (Eq, Show, Functor)
 
-isTyping :: Phase1 a -> Bool
-isTyping (Ph1Typing _ _ _) = True
-isTyping _ = False
+instance Bifunctor Phase1 where
+  bimap f g (Ph1Inline n base  b d m s) =   Ph1Inline n base  (f b) (g d) (g m) (f s)
+  bimap f g (Ph1Shared n base  b d) =       Ph1Shared n base  (f b) (g d)
+  bimap f g (Ph1Typing n io ia v t) = Ph1Typing n io ia (g v) (g t)
 
--- NOTE assumes type : digits per range
-getDsMs :: Integral a => [[Phase1 a]] -> ([a], [a])
-getDsMs ph1ss = unzip $ getDM <$> concat (types : values)
+indexPh1 :: Phase1 a b -> Int
+indexPh1 (Ph1Inline n _ _ _ _ _) = n
+indexPh1 (Ph1Shared n _ _ _) = n
+indexPh1 (Ph1Typing n _ _ _ _) = n
+
+-- Adds zeros where multiplicity vectors are implicitly zero
+getDsMs :: Num b => [Phase1 a b] -> ([b], [b])
+getDsMs ph1s = unzip $ getDM <$> ph1s
   where
-    types = map head ph1ss
-    values = map tail ph1ss
-    getDM (Ph1Inline base  b d m s) = (d, m)
-    getDM (Ph1Shared base  b d)     = (d, 0) 
-    getDM (Ph1Typing isOut v t)     = (t, 0)
+    getDM (Ph1Inline _ _ b d m s) = (d, m)
+    getDM (Ph1Shared _ _ b d)     = (d, 0) 
+    getDM (Ph1Typing _ _ _ v t)   = (t, 0)
 
+-- Stores the data for a valid range. Do not construct directly. Consider adding
+-- Field phantom type parameter to indicate characteristic check?
 data RangeData = RangeData
   { base :: Integer
   , range :: Range
   , isShared :: Bool
-  , isOutput :: Bool
+  , isOutput :: Bool            -- If false then input
+  , isAssumed :: Bool           -- If true, don't range proof only type check
   , hasBit :: Bool
   , baseCoeffs :: [Integer]
-  }
+  } deriving (Eq, Show)
 
-processRanges :: Integer -> Range -> Maybe (Bool, [Integer])
-processRanges b (R min max) = if isValidRange then Just (hasBit, bs) else Nothing
+-- Determine how many norm components this range data will use
+nrmLenRangeData :: RangeData -> Int
+nrmLenRangeData rd = if isShared rd then len else max (fromInteger $ base rd - 1) len
+  where len = length $ baseCoeffs rd
+
+-- Given all the range datas, compute the total number of linear components.
+-- Repeated bases are only counted once, hence the set
+linLenRangeDatas :: [RangeData] -> Int
+linLenRangeDatas rds = fromInteger $ 6 + sum s
+  where s = S.fromList $ pred . base <$> filter isShared rds
+
+-- Accepts field characteristic, base, range [min, max) and flags for whether
+-- digits are shared and whether output (or input). Returns RangeData if the
+-- range is valid
+makeRangeData :: Integer -> Integer -> Range -> Bool -> Bool -> Bool -> Maybe RangeData
+makeRangeData char b r@(R min max) isS isO isAss = if isValidRange then Just (RangeData b r isS isO isAss hasBit bs') else Nothing
   where
-    -- TODO characteristic
-    isValidRange = (max > min) && (b > 1)
+    -- It is probably possible to support negative bases without too much work,
+    -- but isn't practically necessary.
+    isValidRange = (max > min) && (b > 1) && max - min < char
+    -- Number of base b digits
     n1 = integerLog b (max - min - 1)
+    -- If range divisible by b-1, do not need bit
     hasBit = ((max - min - 1) `mod` (b - 1)) /= 0
+    bs' = if isAss then [] else bs
     bs = if not hasBit
            then ((max - min - b^n1) `quot` (b - 1)) : [b^(n1 - i) | i <- [1..n1]]
            else if (max - min < 2 * b^n1)
@@ -123,71 +118,87 @@ processRanges b (R min max) = if isValidRange then Just (hasBit, bs) else Nothin
                   else let bn1 = 1 + (max - min) `quot` (2 * (b-1)) - (b^n1 - 1) `quot` (b - 1)
                        in (max - min - bn1 * (b-1) - b^n1) : bn1 : [b^(n1 - i) | i <- [1..n1]]
 
+
 -- Returns the digits for the given value and base values. If hasBit is true,
 -- first digit is treated as binary.
-digits :: Bool -> Integer -> [Integer] -> Integer -> [Integer]
-digits True base (b:bs) n = bit : digits False base bs n'
-  where (bit, n') = if n > b then (1, n - b) else (0, n)
--- Kinda awkward. 
-digits False base bs n = reverse $ fst $ foldl' (uncurry f) ([], n) bs
-  where f rs n b = let d = min (base-1) $ n `quot` b in (d : rs, n - d * b) 
+digits :: RangeData -> Integer -> [Integer]
+digits rd n = snd $ mapAccumL f n $ zip (baseCoeffs rd) $ appIf (2:) (hasBit rd) $ repeat (base rd)
+  where f n (b, base) = let d = min (base - 1) $ n `quot` b in (n - d * b, d) 
 
-makePhase1s :: Integral a => RangeData -> a -> Maybe ([Phase1 a], Maybe [a])
-makePhase1s (RangeData base (R min max) isShared _ hasBit bs) n = if not isInRange then Nothing else if isShared
-  then let ph1s = fmap fromInteger <$> zipWith3 Ph1Shared bases bs ds
-       in Just (ph1s, Just $ fromInteger <$> ms)
-  else let ((bs', ds'), (ms', ns')) = dup unzip $ unzip $ zipWithDef'' (,) (0, 0) (0, 0) (zip bs ds) (zip ms ns)
-           ph1s = fmap fromInteger <$> zipWith5 Ph1Inline bases bs' ds' ms' ns'
-       in Just (ph1s, Nothing)
-  where 
+-- Given the public information for a range and the witness for a range, if the
+-- witness is valid returns the Phase1 data for each digit and if the range has
+-- shared digits returns the multiplicities for each digit. Also accepts index
+-- in list of ranges
+makePhase1s :: (Show a, Integral a, Integral b) => Int -> RangeData -> b -> Maybe ([Phase1 a b], Maybe [b])
+makePhase1s ind rd _ | isAssumed rd = Just ([], Nothing)                       -- If assumed, no digits
+makePhase1s ind rd@(RangeData base (R min max) isShared _ False hasBit bs) n = res
+  where
     nAdj = toInteger $ n - fromInteger min
     isInRange = (nAdj >= 0) && (max - min > nAdj)
-    ds = digits hasBit base bs nAdj
-    -- NOTE this removes the zero digit
+    ds = digits rd nAdj
+    -- NOTE this removes the zero digit and adds bit
     ms = if hasBit then head ds : (counts [1..base-1] $ tail ds) else counts [1..base-1] ds
     ns = appIf (1 :) hasBit $ [1..base-1]
+    wits = [bs, ds, ms, ns]
     bases = appIf (2 :) hasBit $ repeat base
+    fromInt' = bimap fromInteger fromInteger
+
+    res = if not isInRange 
+      then Nothing 
+      else if isShared
+             then let ph1s = fromInt' <$> zipWith4 Ph1Shared (repeat ind) bases bs ds
+                  in Just (ph1s, Just $ fromInteger <$> ms)
+             else let [bs', ds', ms', ns'] = padRight (maximum $ length <$> wits) 0 <$> wits
+                      ph1s = fromInt' <$> zipWith6 Ph1Inline (repeat ind) bases bs' ds' ms' ns'
+                  in Just (ph1s, Nothing)
+
+-- Make Phase1s with empty witness data. Used by the verifier. Since the data is
+-- empty, it cannot fail and the Just case is safe
+makePhase1sVer :: (Show a, Integral a) => Int -> RangeData -> [Phase1 a ()]
+makePhase1sVer n rd = ph1s
+  where Just (ph1s, _) = makePhase1s n rd ()
 
 -------------
 -- Phase 2 --
 
--- Eqn: qi m y + (qi r + 1/qi u) y^3 + (qi (e + d) + 1/qi v) y^5 + 1/qi c y^7
+-- The polynomial is (for reference):
 --
--- The y^3 term is modified for types so that u = q * (u + qi^2).
--- Otherwise, the phase 2 stores all the information except for q, y to encode
--- the polynomial.
-data Phase2 a = Ph2 { ph1 :: Phase1 a, d :: a, m :: a, u :: a, v :: a, r :: a, c :: a }
+-- qi bl + qi m t + (qi (e + d) + 1/qi v) t^2 + (qi r + 1/qi u) t^3 + 1/qi c t^4
+--
+-- Plus the modifications of ui in the type components depending on q
+data Phase2 a b = Ph2 { isT :: Bool, dPh2 :: b, mPh2 :: b, uPh2 :: a, vPh2 :: a, rPh2 :: b, cPh2 :: a }
   deriving (Eq, Show, Functor)
 
 -- Takes x and the sorted list of bases to produce the phase 2 values. Each value
 -- i=0..n gets x^(2(i+1)) each reciprocal sum gets x^(2i+1). This computes the 
-makePhase2s :: (Fractional a, Integral a) => (a, a) -> a -> M.Map Integer a -> [[Phase1 a]] -> [Phase2 a]
-makePhase2s (e, eInv) x baseMap ph1ss = zipWith3 (($) . ($)) fs rs cs
+makePhase2s :: (Fractional a, Integral a, Fractional b, Integral b, Show a) 
+            => (a -> b -> b) -> Bool -> (a, a) -> a -> M.Map Integer a -> [Phase1 a b] -> [Phase2 a b]
+makePhase2s (*:) hasTypes (e, eInv) x baseMap ph1s = zipWith3 (($) . ($)) fs rs cs
   where
-    types = map ( (:[]) . head ) ph1ss
-    values = map tail ph1ss
-
+    -- Lets us use b ~ () for verification with the same code
+    e' = e *: 1
     (ds, ss, ps, vs, fs) = unzip5 $ do
-      (ph1s, x') <- (zip types $ powers' $ x^2) ++ (zip values $ powers' $ x^2)
       ph1 <- ph1s
+      let x' = x^(2 * (indexPh1 ph1 + 1))
       return $ case ph1 of
-        Ph1Typing isOut v t     -> let x'' = if isOut then -x else x                    -- Subtract output recips
-                                   in (e + t, 0,     v, x'', Ph2 ph1 t 0 x'     x'') 
-        Ph1Inline base  b d m s -> let x'' = baseMap M.! base
-                                   in (e + d, if s == 0 then 0 else e + s, 1, x'', Ph2 ph1 d m (x'*b) x'')
-        Ph1Shared base  b d     -> let x'' = baseMap M.! base
-                                   in (e + d, 0,     1, x'', Ph2 ph1 d 0 (x'*b) x'')
+        Ph1Typing _ io ia v t     -> let x'' = if io then -x else x                    -- Subtract output recips
+                                     in ( e' + t, 0
+                                        , v,     x'', Ph2 True t 0 (if ia then 0 else x') x'')
+        Ph1Inline _ base  b d m s -> let x'' = baseMap M.! base
+                                     in ( e' + d, if s == 0 then 0 else e + s
+                                        , 1,     x'', Ph2 False d m (x'*b) x'')
+        Ph1Shared _ base  b d     -> let x'' = baseMap M.! base
+                                     in ( e' + d, 0
+                                        , 1,     x'', Ph2 False d 0 (x'*b) x'')
 
     rs = zipWith (*) ps $ batchInverse ds
     cs = zipWith (*) vs $ [ if s == 0 then 0 else eInv - s | s <- batchInverse ss ]     -- Same x powers as the reciprocal
 
--- Computes scalar for the r commitment to cancel the y^12 term
-scalarError :: Integral a => [Phase2 a] -> a
-scalarError ph2s = sum $ scErr <$> ph2s
-  where
-    -- NOTE cs has been scaled above already by us and is zero if digits are not
-    -- inline.
-    scErr (Ph2 _ d _ _ _ _ c) = d * c
+-- NOTE cs has been scaled above already by u's and is zero if digits are not
+-- inline.
+err7Term :: (Functor f, Foldable f, Integral a) => f (Phase2 a a) -> a
+err7Term ph2s = sum $ err7 <$> ph2s
+  where err7 (Ph2 _ _ _ _ _ r c) = 2 * r * c
 
 -- Computes public coefficients for the shared bases
 makeSharedCoeffs :: (Integral a, Fractional a) => (a, a) -> [Integer] -> M.Map Integer a -> [a]
@@ -198,233 +209,265 @@ makeSharedCoeffs (e, eInv) mBases baseMap = zipWith (*) sharedXs $ map (eInv -) 
 -- Phase 3 --
 
 -- Stores (q^2i, q^-2i) and blinding 
-data Phase3 a = Ph3 (Phase2 a) (a, a) a
-  deriving (Eq, Show)
+-- Type a is for public data and b is for private
+data Phase3 a b = Ph3 (Phase2 a b) (a, a) b
+  deriving (Eq, Show, Functor)
 
-makeLinearTerms :: Num a => a -> a -> [Phase3 a] -> [a]
-makeLinearTerms e q ph3s = let (a,b,c,d) = sumQuad $ errorTerms <$> ph3s in [a,b,c,d]
+-- This can only be called with the actual witnesses, hence the same type
+makeErrorTerms :: Num a => a -> a -> [a] -> [a] -> [Phase3 a a] -> [a]
+makeErrorTerms e x' sharedCs blsMs ph3s = sums $ ([0, 0, 0, aug, 0, 0] :) $ errorTerms <$> ph3s
   where
-    errorTerms (Ph3 (Ph2 ph1 d m u v r c) (q2, _) bl) = (err2, err4, err6, err10)
+    -- From linear terms
+    aug = 2 * dotZip sharedCs blsMs
+    errorTerms (Ph3 (Ph2 isT d m u v r c) (q2, _) bl) = [err0, err1, err2, err3, err4, err6]
       where
-        rC = if (isTyping ph1) then q * (u + q2) else u
+        rC = if (isT) then x' * (u + q2) else u
         dC = v + q2 * e
-        err2  = q2 * m^2
-        err4  = 2 * (q2 * m * r + m * rC)
-        err6  = q2 * ( r^2 + 2 * d * m ) + 2 * r * rC + 2 * m * dC
-        err10 = q2 * d^2 + 2 * d * dC + 2 * r * c
+        err0 = q2 * bl^2            -- NOTE this goes in scalar component
+        err1 = 2 * q2 * m * bl
+        err2 = q2 * m^2 + 2 * bl * (q2 * d + dC)
+        err3 = 2 * (bl * (q2 * r + rC) + m * (q2 * d + dC))
+        err4 = (q2 * d^2 + 2 * d * dC) + 2 * (bl * c + m * (q2 * r + rC))
+        err6 = (q2 * r^2 + 2 * r * rC) + 2 * c * d
+        -- err7 already known
 
-makePublicConsts :: (Fractional a, Integral a) => (a, a) -> a -> a -> (a, a)
-                 -> [Range] -> [(Bool, Integer, Integer)] -> [Phase3 a] -> RPWitness a
-makePublicConsts (e, eInv) x q (y, yInv) rngs pubVT ph3s = RPW 0 (z + sum ts0) [pubSum] ts1
+-- TODO just accept the setup object?
+makePublicConsts :: (Fractional a, Integral a, Show a) => (a, a) -> a -> a -> (a, a) -> a
+--                 -> Bool -> [Bool] -> [Range] -> [(Bool, Integer, Integer)] -> [Phase2 a b] -> RPWitness a
+                 -> Bool -> [RangeData] -> [(Bool, Integer, Integer)] -> [Phase2 a b] -> RPWitness a
+makePublicConsts (e, eInv) x x' (q0, q0Inv) t hasTypes rds pubVT ph2s = RPW (z + sum ts0) [] ts1
   where
-    -- Implicitly scaled by y^9 to get y^8 (same as inputs)
-    -- Only add back to the digit sums (the x powers) not the products (q powers)
-    z = -2 * yInv * (dotZip (fromInteger . minRange <$> rngs) $ powers' $ x^2)
-    (ts0, ts1) = unzip $ publicTerms <$> ph3s
-  
-    (pubOuts, pubVs, pubTs) = unzip3 pubVT
+    -- Values occur on t^5, remove public inputs if using types
+    isAs = [ (isAssumed rd) | rd <- rds ]
+    mins = replaceIf isAs 0 $ fromInteger . minRange . range <$> rds
+    z = -2 * t^5 * (dotZip mins $ powers' $ x^2) - if hasTypes then 2 * t^5 * x * pubSum else 0
+    (ts0, ts1) = unzip $ publicTerms <$> zip3 ph2s (powers' q0) (powers' $ q0Inv)
+
+    (pubOuts, pubTs, pubVs) = unzip3 pubVT
     pubRs = batchInverse $ map (e +) $ fromInteger <$> pubTs
     pubSum = sum [appIf negate isOut $ r * fromInteger v | (isOut, v, r) <- zip3 pubOuts pubVs pubRs]
 
     -- Inline/Shared digits
-    publicTerms (Ph3 (Ph2 ph1 d _ u v _ c) (q2, qInv2) _) = (p2, p)
+    publicTerms ((Ph2 isT _ _ u v _ c), q2, qInv2) = (p2, p)
       where
-        (rC, p2C) = if (isTyping ph1) 
-          then ( q * (qInv2 * u + 1), 0 )
+        (rC, p2C) = if (isT) 
+          then ( x' * (qInv2 * u + 1), 0 )
           -- TODO only if base is defined here
-          else ( qInv2 * u, (2 * q2 + 2 * eInv * v) * yInv )
-        p = y^3 * rC + y^5 * (e + qInv2 * v) + y^7 * (qInv2 * c)
-        p2 = q2 * (yInv^9 * p^2) + p2C
+          else ( qInv2 * u, (2 * q2 + 2 * eInv * v) )
+        p = t^2 * (e + qInv2 * v) + t^3 * rC + t^4 * (qInv2 * c)
+        p2 = q2 * (p^2) + t^5 * p2C
 
 -------------------------
 -- Prover and Verifier --
 
-data TranscriptTRRP v s = TTRRP { ht :: Bool, commits :: [v], eChallenge :: s, xChallenge :: s
-                              , qChallenge :: s, yChallenge :: s, tChallenge :: s }
-                              deriving (Eq, Show)
+-- For n inputs, we have 4 + n commitments
+data TranscriptTRRP v s
+  = TTRRP 
+  { ht :: Bool
+  , ia :: [Bool]       -- No x power for these
+  , commits :: [v]
+  , eChallenge :: s
+  , xChallenge :: s
+  , q0Challenge :: s
+  , tChallenge :: s 
+  } deriving (Eq, Show)
 
 instance Bifunctor TranscriptTRRP where
-  bimap f g (TTRRP ht coms e x q y t) = TTRRP ht (f <$> coms) (g e) (g x) (g q) (g y) (g t)
+  bimap f g (TTRRP ht ia coms e x q0 t) = TTRRP ht ia (f <$> coms) (g e) (g x) (g q0) (g t)
 
-instance Commitment TranscriptTRRP where
-  commitWith (TTRRP hasTypes (bl2:bl1:rCom:dmCom:mCom:nComs) e x q y t) (*:) (+:) z = dotWith (*:) (+:) ss nComs p
+instance Opening TranscriptTRRP where
+  openWith (TTRRP hasTypes isAs (blCom:rCom:dmCom:mCom:nComs) e x q0 t) = c
     where
-      ss = (*) (2 * recip y) <$> inputCoeffs hasTypes x q      -- Scale scalar by y^9, divide by 1/y to get back to y^8
-      p = sumWith (+:) [(t^2) *: bl2, t *: bl1, y *: mCom, (y^3) *: rCom, (y^5) *: dmCom] z
+      ss = (*) (2 * t^5) <$> inputCoeffs hasTypes isAs x q0
+      c = dotWith ss nComs .: dotWith [1, t, t^2, t^3] [blCom, mCom, dmCom, rCom]
 
-type BPTRRP = Bulletproof TranscriptTRRP (NormLinear [])
+instance RPOpening TranscriptTRRP where
+  type SetupRP TranscriptTRRP = SetupTRRP
+  type WitnessRP TranscriptTRRP = WitnessTRRP
+  type InputWitnessRP TranscriptTRRP = PedersenScalarPair
 
--- TODO this produces a range proof for every commitment and does not support
--- eliminating the extra error terms in the case that all digits are shared.
--- 
+  witnessRP = witnessTRRP
+  proveRP = proveTRRPM
+  verifyRP = verifyTRRPM
+  infoRP s = (4, nrmLen s, linLen s)
+
+type BPTRRP = Bulletproof TranscriptTRRP
+type TypedReciprocal = TranscriptTRRP
+
+-- TODO: improvements
+--
+-- Does not support eliminating the M commitment in the case that all the inputs
+-- use shared digits.
+--
 -- Currently the hasTypes = False just drops types from the norm vector, it
 -- still leaves the error term for types in the linear vector. This allows
 -- passing typed commitments but ignores the types, treating all amounts as the
--- same type. Doesn't affecto proof size for 8 or more digits.
+-- same type. Doesn't affect proof size for 8 or more digits.
 
-
--- This handles all the interactions with the actual basis elements.
-data SetupTRRP v s = STRRP
+-- This abstracts interactions with the specifics of the proof system as much as
+-- possible, i.e. group elements, commitment function, etc.
+data SetupTRRP arg v s = STRRP
   { hasTypes :: Bool                                -- If False, modify input coeffs
   , sortedSharedBases :: [Integer]
-  , publicAmounts :: [(Bool, Integer, Integer)]     -- Stores e.g. public fee amounts (v, t)
+  , nrmLen :: Int
+  , linLen :: Int
+  , publicAmounts :: [(Bool, Integer, Integer)]     -- Stores public amounts (isOutput, v, t)
   , processedRanges :: [RangeData]
   , baseMapSTRRP :: s -> M.Map Integer s            -- Returns mapping of input powers to bases
+  , qPowersTRRP :: s -> [s] 
   , comSTRRP :: RPWitness s -> v
-  , psvSTRRP :: s -> s -> [s] -> RPWitness s -> PedersenScalarVector (NormLinear []) v s
+  , psvSTRRP :: s -> [s] -> RPWitness s -> BPC arg v s
+  , setupSTRRP :: s -> [s] -> RPWitness s -> TypedReciprocal v s -> Setup (BPTRRP arg) v s
   }
 
--- If no types, do not add the q^2 powers
-inputCoeffs :: Integral a => Bool -> a -> a -> [a]
-inputCoeffs hasTypes x q = appIf (zipWith (+) (powers' $ q^2)) hasTypes $ powers' $ x^2
+-- We want to drop the commitment that are assumed. Typically used in
+-- conjunction with inputs that have already been proven
+inputCoeffs :: Integral a => Bool -> [Bool] -> a -> a -> [a]
+inputCoeffs hasTypes assumed x q0 = appIf (zipWith (+) (powers' $ q0)) hasTypes $ xPowers
+  where xPowers = zipWith cond assumed $ powers' $ x^2
+          where cond f x = if f then 0 else x
 
-setupTRRP :: (CanCommit v s) => [v] -> Bool -> [(Bool, Integer, Integer)] -> [(Integer, Range, Bool, Bool)] -> Maybe (SetupTRRP v s)
-setupTRRP (h : g : ps) hasTypes pubVT setupComs = do
-  let (bases, ranges, isShareds, isOuts) = unzip4 setupComs
+-- Accepts basis points, flag for whether to use types, public values, and
+-- RangeData. Constructs the setup object
+setup :: (CanCommit v s, NormLinearBP arg, BPCollection (Coll arg)) 
+          => [v] -> Bool -> [(Bool, Integer, Integer)] -> [RangeData] -> Maybe (SetupTRRP arg v s)
+setup (h : g : ps) hasTypes pubVT rangeDatas = do
+  let (bases, isSs, isAs) = unzip3 [(base rd, isShared rd, isAssumed rd) | rd <- rangeDatas]
+  let anyHasBit = any hasBit $ dropIf isAs $ rangeDatas
+  let anySharedHasBit = any (uncurry $ (&&) . hasBit) $ dropIf isAs $ zip rangeDatas isSs
 
-  -- Extract base values for every commitment [(Bool, [Integer])]
-  (bits, bss) <- fmap unzip $ sequence $ zipWith processRanges bases ranges
-  let anyHasBit = any id bits
-  let anySharedHasBit = any (uncurry (&&)) $ zip bits isShareds
-
-  -- Gives a sorted list of all bases and all shared bases present in proof 
-  let sortedPairs = sortOn snd $ zip isShareds bases
+  -- Each base, and each shared base, gets a unique x power. Common bases share
+  -- an x power, including base 2 for the bit of other ranges/bases
+  let sortedPairs = sortOn snd $ dropIf isAs $ zip isSs bases
   let mBases = deDup $ appIf (2 :) anySharedHasBit $ map snd $ filter fst sortedPairs
   let sortedBases = deDup $ appIf (2 :) anyHasBit $ map snd sortedPairs
 
   -- Allocate one nrm term per digit, one term per type and (b-1) linear terms per shared base
-  let nrmLen = sum $ map (appIf succ hasTypes . length) bss
-  let linLen = fromInteger $ 5 + sum (map pred mBases)
-  
+  let nrmLen = sum $ map (appIf succ hasTypes . length . baseCoeffs) rangeDatas
+  let linLen = fromInteger $ 6 + sum (map pred mBases)
   (hs, ps') <- splitAtMaybe linLen ps
   gs <- takeMaybe nrmLen ps'
 
-  let com (RPW bl sc lin nrm) = commitRPW bl h sc g lin hs nrm gs
+  -- Utility functions
+  let com (RPW sc lin nrm) = commitRPW sc g lin hs nrm gs
   let makeBaseMap x = M.fromList $ zip sortedBases (powers'' (x^3) (x^2))
+  let psv q cs (RPW sc lin nrm) = makePSV sc g $ makeNormLinearBPList q cs nrm gs lin hs
+  let qPowers = qPowers' $ proxy' $ vectorPSV $ psv 1 empty' zeroV
+  let setup' q cs pub init = SBP (psv q cs zeroV) init bpPub $ fst $ optimalWitnessSize pubVec nrmLen linLen
+        where bpPub@(PSV _ pubVec) = psv q cs pub
+  
+  return $ STRRP hasTypes mBases nrmLen linLen pubVT rangeDatas makeBaseMap qPowers com psv setup'
 
-  -- The scalar is scaled by y^9 to move the r term (y^3) to y^12. This is done
-  -- by scaling the linear and norm by 1/y^9.
-  let psv q yInv cs (RPW bl sc lin nrm) = makePSV bl h sc g $ makeNormLinearWithScalar (yInv^9) q cs nrm gs lin hs
-
-  return $ STRRP hasTypes mBases pubVT (zipWith6 RangeData bases ranges isShareds isOuts bits bss) makeBaseMap com psv
-
-data WitnessTRRP v s = WTRRP [PedersenScalarPair v s] [[Phase1 s]] [(Integer, [s])]
+data WitnessTRRP v s = WTRRP [PedersenScalarPair v s] [Phase1 s s] [(Integer, [s])]
   deriving (Eq, Show)
 
 -- The shared bases are Just multiplicites. Add all multiplicities of like
 -- bases
-baseMss :: Num a => [Maybe [a]] -> [Integer] -> [Bool] -> [(Integer, [a])]
+baseMss :: (Show a, Num a) => [Maybe [a]] -> [Integer] -> [Bool] -> [(Integer, [a])]
 baseMss mssMaybe bases bits = M.assocs $ M.fromListWith (zipWith (+)) $ do
   (bit, base, ms) <- catMaybes $ zipWith3 (\a b c -> (a, b, ) <$> c) bits bases mssMaybe
   if bit
     then [(2, [head ms]), (base, tail ms)]
     else [(base, ms)]
 
-witnessTRRP :: CanCommit v s => SetupTRRP v s -> [PedersenScalarPair v s] -> Maybe (WitnessTRRP v s)
-witnessTRRP (STRRP hasTypes mBases _ rcs _ _ _) nPSs = do
+witnessTRRP :: (CanCommit v s, NormLinearBP arg) => SetupTRRP arg v s -> [PedersenScalarPair v s] -> Maybe (WitnessTRRP v s)
+witnessTRRP (STRRP hasTypes _ _ _ pubAmnts rds _ _ _ _ _) nPSs = do
   let (vs, ts) = unzip $ dup scalarCP . pairPSP <$> nPSs 
-  (ph1ss, mssMaybe) <- fmap unzip $ sequence $ zipWith makePhase1s rcs vs
-  let ph1ss' = appIf (zipWith (:) (zipWith3 Ph1Typing (isOutput <$> rcs) vs ts)) hasTypes $ ph1ss
-  return $ WTRRP nPSs ph1ss' $ baseMss mssMaybe (base <$> rcs) (hasBit <$> rcs)
+  
+  -- If uses types, then check that the values of each type add up correctly
+  let pubSums =  M.fromListWith (+) [ (fromInteger $ t, fromInteger $ appIf negate io v) | (io, t, v) <- pubAmnts ]
+  let typeSums = M.fromListWith (+) [ (t, appIf negate (isOutput r) v) | (t, v, r) <- zip3 ts vs rds ] 
+  if hasTypes && not (all (== 0) $ M.elems $ M.unionWith (+) pubSums typeSums)
+    then error $ show $  M.unionWith (+) pubSums typeSums
+    else Just ()
+
+  -- Make phase1 data and organize types to come first, if present
+  (ph1ss, mssMaybe) <- fmap unzip $ sequence $ zipWith3 makePhase1s [0..] rds vs
+  let types = zipWith5 Ph1Typing [0..] (isOutput <$> rds) (isAssumed <$> rds) vs ts
+  let ph1s = appIf (types ++) hasTypes $ concat ph1ss
+  return $ WTRRP nPSs ph1s $ baseMss mssMaybe (base <$> rds) (hasBit <$> rds)
 
 -- Produces linear coefficient vector for bulletproof
-makeBpCoeffs :: Integral a => Bool -> a -> (a, a) -> a -> [a] -> [a]
-makeBpCoeffs hasTypes q (y, yInv) tInv cs = ct : (-tInv*y^2) : (-tInv*y^4) : (-tInv*y^6) : (-tInv*y^10) : cs'
+makeBpCoeffs :: PrimeField a => Bool -> a -> a -> a -> a -> [a] -> [a]
+makeBpCoeffs hasTypes x' r0 r1 t cs = ct : (rs*t) : (rs*t^2) : (rs*t^3) : (r0*t^4) : (rs*t^6) : cs'
   where
-    cs' = (*) (2 * y^3) <$> cs
-    ct = if hasTypes then -q*y^9 else 0
+    rs = r0 * r1
+    cs' = (*) (2 * t^3) <$> cs
+    ct = if hasTypes then -x' else 0
 
 -- Monadic prover
-proveTRRPM :: CanCommitM v s m
-          => SetupTRRP v s -> WitnessTRRP v s -> m ([v], Setup BPTRRP v s, Witness BPTRRP v s)
+proveTRRPM :: (CanCommitM v s m, NormLinearBP arg)
+          => SetupTRRP arg v s -> WitnessTRRP v s -> m ([v], Setup (BPTRRP arg) v s, Witness (BPTRRP arg) v s)
 
-proveTRRPM (STRRP hasTypes mBases pubVT rcs makeBaseMap' commit' makePSV') (WTRRP nPSs ph1ss baseMss) = do
+proveTRRPM (STRRP hasTypes mBases nrmLen linLen pubVT rds makeBaseMap' qPowers commit' makePSV' setup') (WTRRP nPSs ph1s baseMss) = do
   -- Phase 1: commit to digits and multiplicities
-  let ranges = map range rcs
+  let numTerms = 3
+  let isAs = isAssumed <$> rds
   let (mBases, msShared) = concat <$> unzip baseMss
-  let (ds, msInline) = getDsMs ph1ss
-  let len = length ds
+  let (ds, msInline) = getDsMs ph1s
 
-  (nWits, nComs) <- unzip <$> map (idAp commit') <$> mapM scalarPairRPW nPSs
-  (dmWit, dmCom) <- idAp commit' <$> blindedRPW 0 (0 : 0 : 0 : 0 : 0 : msShared) ds
-  (mWit, mCom) <- idAp commit' <$> normRPW 0 msInline
-  ex <- take 2 <$> oracle (dmCom : mCom : nComs)
-  let [e, x] = ex
-  let eInv = recip e
+  (nWits, nComs) <- unzip <$> map (idAp commit') <$> mapM scalarPairRPW' nPSs
+  (dmWit, dmCom) <- idAp commit' <$> blindWitness numTerms 2 msShared ds
+  (mWit, mCom) <- idAp commit' <$> blindWitness numTerms 1 [] msInline 
+  
+  T3 e x r0 <- oracle' (dmCom : mCom : nComs)
+  let [eInv, r0Inv] = batchInverse [e, r0]
 
   -- Phase 2: compute and commit to recips
   let baseMap = makeBaseMap' x
-  let ph2s = makePhase2s (e, eInv) x baseMap ph1ss
-  (rWit, rCom) <- idAp commit' <$> normRPW (scalarError ph2s) [ r | Ph2 _ _ _ _ _ r _ <- ph2s]
-  q <- head <$> oracle [rCom]
+  let ph2s = makePhase2s (*) hasTypes (e, eInv) x baseMap ph1s
+  let err7 = r0Inv * negate (err7Term ph2s)
+  (rWit, rCom) <- idAp commit' <$> blindErrWitness numTerms [err7] [] (rPh2 <$> ph2s)
+ 
+  T3 q x' r1 <- oracle' [rCom]
+  let q0 = head $ qPowers q
+  let [qInv, q0Inv, r1Inv] = batchInverse [q, q0, r1]
   let sharedCs = makeSharedCoeffs (e, eInv) mBases baseMap
+  let tC = if hasTypes then x' else 0
 
   -- Phase 3: compute and commit to error terms and norm blinding
-  bl1Sc <- random
-  blsMs <- replicateM (length msShared) random
-  blType <- random
-  blsNrm <- replicateM len random
-  let ph3s = zipWith3 Ph3 ph2s ( zip (powers' $ q^2) (powers' $ (recip q)^2) ) blsNrm
-  (bl1Wit, bl1Com) <- idAp commit' <$> blindedRPW bl1Sc (blType : makeLinearTerms e q ph3s ++ blsMs) blsNrm
-  y <- head <$> oracle [bl1Com]
-  let yInv = recip y
+  blBls@(RPW _ blsLin blsNrm) <- RPW 0 <$> replicateM (linLen - 5) random <*> replicateM nrmLen random
+  let blType:blsMs = blsLin
 
-  -- Phase 4: compute and commit to error term blinding
-  let pub = makePublicConsts (e, eInv) x q (y, yInv) ranges pubVT ph3s
-  let wit = pub ^+^ y*^mWit ^+^ (y^3)*^rWit ^+^ (y^5)*^dmWit ^+^ (2 * yInv) *^ sumV (zipWith (*^) (inputCoeffs hasTypes x q) nWits)
-  let (bl1Tm, bl2Sc) = makeBlindingTerms (powers' $ q^2) (getNormRPW wit) blsNrm
-  T3 err4Bl err6Bl err10Bl <- random'
-  let errSumBl = yInv^2 * bl1Tm - y^7 * (bl1Sc + if hasTypes then q * blType else 0) + 2 * y * dotZip sharedCs blsMs 
-  let err2Bl = errSumBl - (err4Bl * y^2 + err6Bl * y^4 + err10Bl * y^8)
-  (bl2Wit, bl2Com) <- idAp commit' <$> linearRPW (bl2Sc * yInv^9) [0, err2Bl, err4Bl, err6Bl, err10Bl]
-  t <- head <$> oracle [bl2Com]
-  let tInv = recip t
+  let nWitSum@(RPW _ [_, inputBl] _) = sumV (zipWith (*^) (inputCoeffs hasTypes isAs x q0) nWits)
+  let ph3s = zipWith3 Ph3 ph2s ( zip (qPowers q) (qPowers qInv) ) blsNrm
+  let errs = makeErrorTerms e x' sharedCs blsMs ph3s
+  (blWit, blCom) <- idAp commit' <$> blindBlindingTerm blBls tC (r0, r0Inv) (r1, r1Inv) errs [mWit, dmWit, rWit] inputBl
+  t <- head <$> oracle [blCom]
+ 
+  -- Phase 4: setup bulletproof
+  let pub = makePublicConsts (e, eInv) x x' (q0, q0Inv) t hasTypes rds pubVT ph2s
+  let wit = pub ^+^ blWit ^+^ t*^mWit ^+^ (t^2)*^dmWit ^+^ (t^3)*^rWit ^+^ (2 * t^5) *^ nWitSum
 
-  -- Phase 5: setup bulletproof
-  let coms = bl2Com : bl1Com : rCom : dmCom : mCom : nComs
-  let bpCom = TTRRP hasTypes coms e x q y t
-  let bpRounds = (fromInteger $ integerLog 2 $ toInteger len) - 1
-  let makeCom = makePSV' q yInv $ makeBpCoeffs hasTypes q (y, yInv) tInv sharedCs
-  let bpWit = makeCom $ wit ^+^ t*^bl1Wit ^+^ (t^2)*^bl2Wit
-
-  return (coms, SBP (makeCom zeroV) bpCom (makeCom pub) bpRounds, WBP bpWit)
+  let coms = blCom : rCom : dmCom : mCom : nComs
+  let bpCom = TTRRP hasTypes isAs coms e x q0 t
+  let bpCoeffs = makeBpCoeffs hasTypes x' r0 r1 t sharedCs
+  return (coms, setup' q bpCoeffs pub bpCom, WBP $ makePSV' q bpCoeffs wit)
 
 -- Monadic verifier. 
-verifyTRRPM :: CanCommitM v s m => SetupTRRP v s -> [v] -> m (Setup BPTRRP v s)
-verifyTRRPM (STRRP hasTypes mBases pubVT rcs makeBaseMap' _ makePSV') coms = do
-  let ranges = map range rcs
-  let mins = fromInteger . minRange <$> ranges
-  let Just ph1ss = fmap (fst . unzip) $ sequence $ zipWith makePhase1s rcs mins
-  let ph1ss' = appIf (zipWith (:) (map (\rc -> Ph1Typing (isOutput rc) 0 0) rcs)) hasTypes ph1ss
-  
-  let (bl2Com : bl1Com : rCom : dmCom : mCom : nComs) = coms
-  ex <- take 2 <$> oracle (dmCom : mCom : nComs)
-  let [e,x] = ex
-  q <- head <$> oracle [rCom]
-  y <- head <$> oracle [bl1Com]
-  t <- head <$> oracle [bl2Com]
-  let [eInv, qInv, yInv, tInv] = batchInverse [e, q, y, t]
+verifyTRRPM :: (CanCommitM v s m, NormLinearBP arg) => SetupTRRP arg v s -> [v] -> m (Setup (BPTRRP arg) v s)
+verifyTRRPM (STRRP hasTypes mBases _ _ pubVT rds makeBaseMap' qPowers _ _ setup') coms = do
+  -- Initialize ph1s to be empty
+  let ph1ss = zipWith makePhase1sVer [0..] rds
+  let types = zipWith (\ind rc -> Ph1Typing ind (isOutput rc) (isAssumed rc) () ()) [0..] rds
+  let ph1s = appIf (types ++) hasTypes $ concat ph1ss
 
+  -- Get commitments and compute challenges
+  let (blCom : rCom : dmCom : mCom : nComs) = coms
+  T3 e x r0 <- oracle' (dmCom : mCom : nComs)
+  T3 q x' r1 <- oracle' [rCom]
+  let q0 = head $ qPowers q
+  t <- head <$> oracle [blCom]
+  let [eInv, qInv, q0Inv] = batchInverse [e, q, q0]
   let baseMap = makeBaseMap' x
-  let ph2s = makePhase2s (e, eInv) x baseMap ph1ss'
-  let ph3s = zipWith3 Ph3 ph2s ( zip (powers' $ q^2) (powers' $ qInv^2) ) $ repeat 0
-
-  let rounds = (fromInteger $ integerLog 2 $ toInteger $ length ph2s) - 1
-  let pub = makePublicConsts (e, eInv) x q (y, yInv) ranges pubVT ph3s
-  let makeCom = makePSV' q yInv $ makeBpCoeffs hasTypes q (y, yInv) tInv $ makeSharedCoeffs (e, eInv) mBases baseMap
-
-  return $ SBP (makeCom zeroV) (TTRRP hasTypes coms e x q y t) (makeCom pub) rounds 
-
-data TypedReciprocalRangeProof v s = TRRP [v] (BPTRRP v s)
-
-instance ZKP TypedReciprocalRangeProof where
-  type Setup TypedReciprocalRangeProof v s = SetupTRRP v s
-  type Witness TypedReciprocalRangeProof v s = WitnessTRRP v s
+  let ph2s = makePhase2s (flip const) hasTypes (e, eInv) x baseMap ph1s
+  let pub = makePublicConsts (e, eInv) x x' (q0, q0Inv) t hasTypes rds pubVT ph2s
   
-  proveM s w = do
-    (coms, s', w') <- proveTRRPM s w
-    TRRP coms <$> proveM s' w'
+  -- Prepare bulletproof
+  let bpCoeffs = makeBpCoeffs hasTypes x' r0 r1 t $ makeSharedCoeffs (e, eInv) mBases baseMap
+  return $ setup' q bpCoeffs pub (TTRRP hasTypes (isAssumed <$> rds) coms e x q0 t)
 
-  verifyM s (TRRP coms p') = do
-    s' <- verifyTRRPM s coms
-    verifyM s' p'
+-- TODO : Batch Verifier
+-- Batch verifier accepts a list of proofs as witness, takes a random linear
+-- combination, computes the scalars in the same manner as the bulletproof, and
+-- and then performs a single ec inner product to verify all of them at once.
