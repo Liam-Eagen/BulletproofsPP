@@ -1,5 +1,5 @@
 {
-  "basisFile" : "points.bin",
+  "basisSeed" : "test points",
   "ranges" : [{
     "base"   : 9,
     "min"    : 0,

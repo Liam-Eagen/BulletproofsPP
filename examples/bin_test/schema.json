@@ -1,7 +1,7 @@
 {
   "binary" : true,
   "conserved" : true,
-  "basisFile" : "points.bin",
+  "basisSeed" : "test points",
   "argument" : "NL",
   "ranges" : [{
     "min"    : 3,

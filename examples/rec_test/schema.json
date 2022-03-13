@@ -1,6 +1,6 @@
 {
   "typed"  : true,
-  "basisFile" : "points.bin",
+  "basisSeed" : "test points",
   "ranges" : [{
     "base"   : 3,
     "min"    : 0,

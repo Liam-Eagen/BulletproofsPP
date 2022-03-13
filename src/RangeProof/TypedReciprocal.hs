@@ -398,7 +398,6 @@ makeBpCoeffs hasTypes x' r0 r1 t cs = ct : (rs*t) : (rs*t^2) : (rs*t^3) : (r0*t^
 -- Monadic prover
 proveTRRPM :: (CanCommitM v s m, NormLinearBP arg)
           => SetupTRRP arg v s -> WitnessTRRP v s -> m ([v], Setup (BPTRRP arg) v s, Witness (BPTRRP arg) v s)
-
 proveTRRPM (STRRP hasTypes mBases nrmLen linLen pubVT rds makeBaseMap' qPowers commit' makePSV' setup') (WTRRP nPSs ph1s baseMss) = do
   -- Phase 1: commit to digits and multiplicities
   let numTerms = 3
