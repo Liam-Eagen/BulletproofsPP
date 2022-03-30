@@ -1,4 +1,4 @@
-# BulletproofsPP
+# Bulletproofs++
 
 ## Caveats
 
@@ -20,16 +20,16 @@ transactions with multiple types. For detailed information, see the paper.
 
 Bulletproofs use an inner product argument to prove that the inner product of
 two committed vectors equals a committed scalar by recursively reducing the size
-of the vectors by half. Bulletproofs+ modify this arugment to prove that the
+of the vectors by half. Bulletproofs+ modify this argument to prove that the
 value equals the weighted inner product of two vectors. Bulletproofs++ modify
 this again to show that the weighted inner product of a vector with itself
 equals the committed value while only committing to the vector once.
 
-There are two ways to do this, the first works when the weightes are of the same
+There are two ways to do this, the first works when the weights are of the same
 quadratic residue class as negative one and transforms each weighted difference
 of squares into a product. The result is an inner product of two vectors of half
 the length, after which a variant of the weighted inner product argument can be
-applied.  The other way uses a seperate norm argument with a modified round
+applied.  The other way uses a separate norm argument with a modified round
 structure. See paper for details.
 
 Both also support a combined linear argument, where the prover can show that a
@@ -46,60 +46,75 @@ instead of an inner product argument. In Bulletproof(+) range proofs commit to a
 vector of binary digits and a vector of their complements and use the inner
 product argument to show that each digit times its complement is zero.
 Completing the square for each of these multiplications, we can commit to each
-digit once and use the norm arugment to perform an equivalent check. This
-reduces the witness length of binary range proofs by half.
+digit once and use the norm argument to perform an equivalent check. This
+reduces the witness length of binary range proofs by half. Binary range proofs
+are implemented in `RangeProof.Binary`.
+
+### Reciprocal Argument
+
+The core of range proofs with larger bases and typed conservation of money is a
+permutation argument for multisets. The polynomial permutation argument shows
+that two mulitsets `A` and `B` are the same by showing for a random e
+
+`Prod_{(a, m) in A} (e + a)^m = Prod_{(b, m) in B} (e + b)^m`
+
+This works because multiplication is an abelian group and the difference of the
+polynomials is only zero at a negligible number of points. Rather than use a
+product of monomials, Bulletproofs++ use a sum of reciprocal monomials to
+achieve the same effect. This allows including multiplicities, which in the
+polynomial case are exponents, as field values.
+
+`Sum_{(a, m) in A} m / (e + a) = Sum_{(b, m) in B} m / (e + b)`
+
+This relation is actually the logarithmic derivative of the polynomial argument.
+The structure of the zero knowledge proof protocols follows naturally from this,
+the prover first commits to the sets and multiplicities, then the verifier
+chooses the challenge value, and the prover commits to the terms in the sum.
 
 ### Reciprocal Range Proof
 
-Bulletproofs++ also differ from the earlier protocols in that they support range
-proofs with larger bases than 2. At a high level, the way this is possible is by
-encoding the digits of a value in base b as the roots of a polynomial. Taking
-the logarithmic deriviative of the polynomial, we can write the rational
-function in two ways, first as a sum of reciprocal monomials corresponding to
-each digit of the value and then as a sum of public symbol values times the
-multiplicity of the symbol in the value.
+For a base `b` range proof for the value `v = Sum_{i=0..n-1} b^i d_i` with
+`m_j` being the multiplicity of the value `j` among the `d_i`, the prover will
+show
 
-There are two ways to show this in a zero knowledge proof, first using a
-different set of symbols and multiplicities for each value and also using a
-shared set of symbols and multiplicities. For smaller numbers of values, the
-first is preferable for technical reasons, but for larger numbers of values the
-shared digits can acheive significantly reduced witness and proof sizes.
+`Sum_{i=0..n-1} 1/(e + d_i) = Sum_{j=0..b-1} m_j / (e + j)`
+
+There are two types of reciprocal range proofs: in the first the multiplicities
+are distinct for each value and in the second multiple aggregated values will
+use the same multiplicities.
 
 ### Typed Conservation of Money
 
-When used in cryptocurrencies, range proofs are typically used to perform
-confidential transactions, where the amounts involved in the transaction are
-hidden from public view. Transaction correctness is established via a zero
-knowledge proof of conservation of money, which shows that the amount flowing
-into a transaction is equal to the amount flowing out of a transaction. Range
-proofs are necessary to show that all of these amounts of money are positive
-integers.
+To show typed conservation of money, the prover wants to show for a set of triples 
+`(t,v,o)` where `t` is the type, `v` is the amount, and `o` is zero for inputs and
+one for outputs that
 
-The same reciprocal technique used by the range proof is then used to construct
-a proof of conservation of money for multiplie types of money that is zero
-knowledge in the types, the number of types, and the relationships between the
-types of different values. That is, zero knowledge up to whatever is publically
-known about the transaction (i.e. if a fee of type t is payed, at least one
-input must be of type t, it there is only one output all the inputs must be the
-same type, etc.) 
+`Sum_{(t,v,o)} (-1)^o v/(e + t) = 0`
+
+Since the structure of this proof is so similar to the reciprocal range proofs,
+it costs very little to show typed conservation in addition to a range proof.
+Both of these protocols are implemented in `RangeProof.TypedReciprocal` which
+allows optionally turning on or off various features.
 
 ## How to use
 
 The library exposes interfaces for proving and verifying range proofs in
-RangeProof.Binary (for binary range proofs) and RangeProof.TypedReciprocal (for
-reciprocal range proofs).
+`RangeProof.Binary` (for binary range proofs) and `RangeProof.TypedReciprocal` (for
+reciprocal range proofs). There are also interfaces for an abstract norm/linear
+argument and implementations using a weighted inner product and a norm argument
+in the `Bulletproof` module.
 
 ### Arguments
 
-The arguments are of the typeclass BPCommitment and expose the functions
+The arguments are of typeclass `BPCommitment` and expose the functions
 necessary to collapse the commitment after one round, compute the opening for
 verification, etc. They are composable so that two arguments with the same round
 structure can be combined to create a compound argument
 
 ### Range Proofs
 
-The range proofs are of class RPCommitment and expose the function to prove and
-verify range proofs before engaging the bulletproof argument. They are
+The range proofs are of class `RPCommitment` and expose the functions to prove and
+verify range proofs before engaging the Bulletproof argument. They are
 parametric over the underlying argument and can be instantiated to use the norm
 or inner product argument.
 
@@ -113,7 +128,7 @@ base for reciprocal range proofs.
 ### Command line utility
 
 There is also a command line tool for proving and verifying range proofs of
-SECP256k1. The proof is described by a json schema that describes the various
+SECP256k1. The proof is described by a json schema that specifies the various
 properties of the proof including the type of proof, whether to do prove
 conservation of money, which set of basis points to use, as well as schemas for
 the ranges. These include the range [min, max), whether the input is an input or
@@ -122,7 +137,7 @@ inputs), as well as several options for reciprocal range proofs including the
 base and whether to share the digits. The schema can also specify public inputs
 and outputs to the transaction.
 
-The witness is specified via a seperate json file, which is a list of objects
+The witness is specified via a separate json file, which is a list of objects
 specifying the amount, type (for reciprocal range proofs), and optionally a
 blinding value for preexisting commitments.
 
@@ -130,7 +145,7 @@ In prove mode, the tool will write out a proof in a binary format to the
 specified proof file. This format is not intended to be compatible with
 anything, and is minimal in the sense that it includes only the responses and
 final openings of the commitments. It cannot be verified without the schema. The
-commitments are written to a seperate commitment file. In verify mode, the tool
+commitments are written to a separate commitment file. In verify mode, the tool
 will read from the proof file and commitment file. In test mode, the tool will
 run the prover, verify the proof, write the proof and coms to their files, and
 then run the verifier.
@@ -139,46 +154,48 @@ then run the verifier.
 
 This code is not competitive with implementations in C or Rust or that use
 highly performant libraries for the elliptic curve operations. However, it is
-possible to roughly estimate the theoretical performance of Bulletproofs++ by
-counting the number of elliptic curve operations, as these are by far the most
-time consuming part of both proving and verification. By these metrics, a 64 bit
+possible to estimate the theoretical performance of Bulletproofs++ by counting
+the number of elliptic curve operations, as these are by far the most time
+consuming part of both proving and verification. By these metrics, a 64 bit
 range proof using 16 base 16 digits would require approximately half as many
 elliptic curve operations to prove and about 18 percent as many to verify.
 
 Proof size is easy to measure, and for many applications is similarly important
 to verification time. The case of the 64 bit range proof is particularly
 important in practice, as most cryptocurrencies store amounts using a number of
-bits that is approximately 64.
+bits that is approximately 64. For curves where both curve points and scalar are
+represented using 32 byte values the proof sizes are
 
 #### 1x64 bit (bytes)
-Bulletproofs: 672
-Bullteproofs+: 576 (Delta 96)
-Bulletproofs++: 416 (Delta 256)
+* Bulletproofs: 672
+* Bulletproofs+: 576 (Delta 96)
+* Bulletproofs++: 416 (Delta 256)
 
 #### 2x64 bit (bytes
-Bulletproofs:   736
-Bulletproofs+:  640 (Delta 96)
-Bulletproofs++: 480 (Delta 256)
+* Bulletproofs:   736
+* Bulletproofs+:  640 (Delta 96)
+* Bulletproofs++: 480 (Delta 256)
 
 ## Improvements
 
 There are several features from the paper currently not implemented in code, but
 are in the paper
 
+* More Elliptic Curves
 * Arithmetic Circuits
 * Multiparty Proving
 * Batch Verification
-* Eliminaton of the seperate multiplicity commitment when all bases are shared.
+* Elimination of the separate multiplicity commitment when all bases are shared.
 * Differentiating conserved, as in the amounts sum to zero, from typed
-  reciprocal range proofs. Also, eliminate the type component in the case types
-  are not used.
+  reciprocal range proofs
+* Eliminate the type component in the case types are not used
 
 There are also a bunch of opportunities for improvement. In no particular order
 these are
 
 * Transition to using a better (faster/complete/tested) EC library, presumably 
   via FFI bindings.
-* Alternatively, implement a pure Haskell EC library that is ``good enough."
+* Alternatively, implement a pure Haskell EC library that is "good enough."
   Already have some code for finite field operations that is better that
   Integers and mod p after every operation, but a lot of room for improvement.
 * In that vein, test performance of using shared/unboxed vectors, depending on
